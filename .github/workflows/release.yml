@@ -1,0 +1,118 @@
+name: Release artifacts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag of the release to attach artifacts to (e.g. v1.0.0). Leave empty to run the build only.'
+        required: false
+        type: string
+
+# Plugins are Go shared objects. `-buildmode=plugin` CANNOT be cross-compiled,
+# and each .so must match Bifrost's OS/arch AND Go version. So we build each
+# combination on a native runner (same OS + native arch), then attach results
+# to the release with unambiguous <plugin>_<os>_<arch> names.
+#
+#   linux/amd64  -> ubuntu-latest           (x86_64)
+#   linux/arm64  -> ubuntu-24.04-arm        (arm64)
+#   darwin/arm64 -> macos-14                (Apple Silicon arm64)
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+    env:
+      GO_VERSION: "1.26"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Pull the module's exact toolchain patch from go.mod (e.g. 1.26.4).
+          # Plugins must be built with the SAME Go version as Bifrost.
+          check-latest: true
+
+      - name: Build claude-sub-plugin (.so + login CLI)
+        working-directory: claude-sub-plugin
+        run: make build-all
+
+      - name: Build codex-sub-plugin (.so + login CLI)
+        working-directory: codex-sub-plugin
+        run: make build-all
+
+      - name: Sanity check exported symbols
+        working-directory: claude-sub-plugin
+        run: |
+          go tool nm build/claude-sub.so | grep -E 'Init|GetName|PreRequestHook|PreLLMHook|PostLLMHook|Cleanup'
+          echo "(claude symbols present)"
+
+      - name: Sanity check exported symbols
+        working-directory: codex-sub-plugin
+        run: |
+          go tool nm build/codex-sub.so | grep -E 'Init|GetName|PreRequestHook|PreLLMHook|PostLLMHook|Cleanup'
+          echo "(codex symbols present)"
+
+      # Gather everything under a per-matrix staging dir so named release
+      # assets are unambiguous, then upload as a workflow artifact.
+      - name: Stage release assets
+        run: |
+          mkdir -p staged
+          cp claude-sub-plugin/build/claude-sub.so      staged/claude-sub_${{ matrix.os }}_${{ matrix.arch }}.so
+          cp codex-sub-plugin/build/codex-sub.so        staged/codex-sub_${{ matrix.os }}_${{ matrix.arch }}.so
+          cp claude-sub-plugin/build/claude-sub-login   staged/claude-sub-login_${{ matrix.os }}_${{ matrix.arch }}
+          cp codex-sub-plugin/build/codex-sub-login     staged/codex-sub-login_${{ matrix.os }}_${{ matrix.arch }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bifrost-plugins_${{ matrix.os }}_${{ matrix.arch }}
+          path: staged/*
+
+  # Attach all per-platform artifacts to the GitHub Release.
+  attach:
+    name: Attach to release
+    needs: build
+    if: ${{ (github.event_name == 'release' && github.event.action == 'published') || inputs.release_tag != '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.resolve_tag.outputs.release_tag }}
+    steps:
+      - name: Resolve target release tag
+        id: resolve_tag
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            echo "release_tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: downloaded
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.resolve_tag.outputs.release_tag }}
+          files: |
+            downloaded/*/*
+          fail_on_unmatched_files: true
