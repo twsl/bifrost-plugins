@@ -2,7 +2,7 @@ module github.com/twsl/bifrost/claude-sub-plugin
 
 go 1.26.5
 
-require github.com/maximhq/bifrost/core v1.7.12
+require github.com/maximhq/bifrost/core v1.7.13
 
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
